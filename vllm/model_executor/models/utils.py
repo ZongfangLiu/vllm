@@ -600,14 +600,21 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
-            for idx in range(start_layer, end_layer)
-        ]
-        + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
-    )
+    built_layers: list[torch.nn.Module] = []
+    for idx in range(start_layer):
+        built_layers.append(PPMissingLayer())
+
+    for idx in range(start_layer, end_layer):
+        try:
+            layer = layer_fn(prefix=f"{prefix}.{idx}", idx=idx)
+        except TypeError:
+            layer = layer_fn(prefix=f"{prefix}.{idx}")
+        built_layers.append(maybe_offload_to_cpu(layer))
+
+    for _ in range(end_layer, num_hidden_layers):
+        built_layers.append(PPMissingLayer())
+
+    modules = torch.nn.ModuleList(built_layers)
     return start_layer, end_layer, modules
 
 

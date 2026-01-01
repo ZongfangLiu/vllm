@@ -214,7 +214,13 @@ class OlmoeAttention(nn.Module):
 
 
 class OlmoeDecoderLayer(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        num_experts: int | None = None,
+    ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -226,9 +232,13 @@ class OlmoeDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
+        experts_this_layer = num_experts or config.num_experts
+        top_k = min(config.num_experts_per_tok, experts_this_layer)
+        self.num_experts = experts_this_layer
+        self.top_k = top_k
         self.mlp = OlmoeMoE(
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=experts_this_layer,
+            top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
@@ -273,6 +283,11 @@ class OlmoeModel(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        # Support per-layer expert counts; fall back to uniform.
+        per_layer_experts = getattr(config, "num_experts_per_layer", None)
+        if per_layer_experts is None or len(per_layer_experts) != config.num_hidden_layers:
+            per_layer_experts = [config.num_experts for _ in range(config.num_hidden_layers)]
+        self.num_experts_per_layer = [int(x) for x in per_layer_experts]
 
         self.vocab_size = config.vocab_size
         self.config = config
@@ -282,7 +297,11 @@ class OlmoeModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix, idx=0: layer_type(
+                vllm_config=vllm_config,
+                prefix=prefix,
+                num_experts=self.num_experts_per_layer[idx],
+            ),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
@@ -333,12 +352,25 @@ class OlmoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        mapping: list[tuple[str, str, int, str]] = []
+        for layer_idx, num_experts in enumerate(self.num_experts_per_layer):
+            base_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            for param_name, weight_name, expert_id, shard_id in base_mapping:
+                layer_prefix = f"layers.{layer_idx}.mlp."
+                mapping.append(
+                    (
+                        layer_prefix + param_name,
+                        layer_prefix + weight_name,
+                        expert_id,
+                        shard_id,
+                    )
+                )
+        return mapping
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
