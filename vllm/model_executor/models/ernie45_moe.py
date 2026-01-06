@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only ErineMoE model compatible with HuggingFace weights."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -77,6 +78,59 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_EXPERT_IDX_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def _parse_layer_idx_from_weight_name(name: str) -> int | None:
+    m = _LAYER_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_expert_idx_from_weight_name(name: str) -> int | None:
+    m = _EXPERT_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _get_num_experts_for_layer(config: PretrainedConfig, layer_idx: int) -> int:
+    get_num_experts = getattr(config, "get_num_experts", None)
+    if callable(get_num_experts):
+        return int(get_num_experts(layer_idx))
+
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if isinstance(per_layer, list) and 0 <= layer_idx < len(per_layer):
+        return int(per_layer[layer_idx])
+
+    return int(getattr(config, "moe_num_experts", 0))
+
+
+def _is_non_uniform_expert_config(config: PretrainedConfig) -> bool:
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if not isinstance(per_layer, list) or not per_layer:
+        return False
+    try:
+        vals = [int(v) for v in per_layer]
+    except Exception:
+        return False
+    return len(set(vals)) > 1
+
+
+def _remap_moe_statics_bias_name(name: str) -> str | None:
+    # HF checkpoints may store it under either:
+    # - model.layers.N.mlp.moe_statics.e_score_correction_bias
+    # - model.layers.N.mlp.gate.moe_statics.e_score_correction_bias
+    # vLLM expects: model.layers.N.mlp.gate.e_score_correction_bias
+    if not name.endswith("e_score_correction_bias") or "moe_statics" not in name:
+        return None
+
+    if ".gate.moe_statics." in name:
+        return name.replace(".gate.moe_statics.", ".gate.", 1)
+    if ".mlp.moe_statics." in name:
+        return name.replace(".mlp.moe_statics.", ".mlp.gate.", 1)
+
+    # Fallback: keep behavior compatible with earlier implementation.
+    return name.replace("moe_statics", "gate", 1)
+
 
 class Ernie4_5_MoeMLP(nn.Module):
     def __init__(
@@ -125,6 +179,7 @@ class Ernie4_5_MoeMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        num_experts: int | None = None,
     ):
         super().__init__()
 
@@ -136,7 +191,11 @@ class Ernie4_5_MoeMoE(nn.Module):
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
-        self.n_routed_experts: int = config.moe_num_experts
+        self.n_routed_experts = (
+            int(num_experts)
+            if num_experts is not None
+            else int(getattr(config, "moe_num_experts", 0))
+        )
         self.n_shared_experts: int = self.moe_num_shared_experts
 
         # Load balancing settings.
@@ -144,25 +203,27 @@ class Ernie4_5_MoeMoE(nn.Module):
         eplb_config = vllm_config.parallel_config.eplb_config
         self.enable_eplb = enable_eplb
 
-        self.n_redundant_experts = eplb_config.num_redundant_experts
+        # NOTE: vLLM's EPLB assumes a uniform expert count across MoE layers.
+        # For non-uniform models, disable redundant experts to avoid mismatched
+        # global expert shapes in EPLB policies.
+        if enable_eplb and _is_non_uniform_expert_config(config):
+            self.n_redundant_experts = 0
+        else:
+            self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
         self.has_shared_experts = getattr(config, "moe_num_shared_experts", 0) > 0
 
-        if self.tp_size > config.moe_num_experts:
+        if self.n_routed_experts <= 0:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.moe_num_experts}."
+                f"Invalid routed expert count for layer {layer_idx}: "
+                f"{self.n_routed_experts}. Check `moe_num_experts` and/or "
+                "`num_experts_per_layer` in the HF config."
             )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
-            config.moe_num_experts,
+            self.n_routed_experts,
             bias=False,
             params_dtype=torch.float32,
             quant_config=None,
@@ -170,7 +231,7 @@ class Ernie4_5_MoeMoE(nn.Module):
         )
 
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.moe_num_experts, dtype=torch.float32)
+            torch.empty(self.n_routed_experts, dtype=torch.float32)
         )
 
         if self.has_shared_experts:
@@ -190,8 +251,8 @@ class Ernie4_5_MoeMoE(nn.Module):
 
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_experts,
-            num_experts=config.moe_num_experts,
-            top_k=config.moe_k,
+            num_experts=self.n_routed_experts,
+            top_k=min(int(config.moe_k), self.n_routed_experts),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
@@ -202,6 +263,15 @@ class Ernie4_5_MoeMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
         )
+
+        # Align metadata with FusedMoE's EP partitioning logic.
+        self.n_physical_experts = self.experts.global_num_experts
+        self.n_local_physical_experts = self.experts.local_num_experts
+        base_experts = self.n_physical_experts // self.ep_size
+        remainder = self.n_physical_experts % self.ep_size
+        start_idx = self.ep_rank * base_experts + min(self.ep_rank, remainder)
+        self.physical_expert_start = start_idx
+        self.physical_expert_end = start_idx + self.n_local_physical_experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -356,7 +426,13 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
             config, "moe_layer_end_index", config.num_hidden_layers - 1
         )
         moe_layer_interval = getattr(config, "moe_layer_interval", 1)
-        use_moe = getattr(config, "use_moe", moe_num_experts > 0)
+        per_layer = getattr(config, "num_experts_per_layer", None)
+        use_moe = getattr(
+            config,
+            "use_moe",
+            moe_num_experts > 0
+            or (isinstance(per_layer, list) and any(int(v) > 0 for v in per_layer)),
+        )
 
         if (
             use_moe
@@ -364,11 +440,13 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
             and layer_idx >= moe_layer_start_index
             and layer_idx <= moe_layer_end_index
         ):
+            num_experts = _get_num_experts_for_layer(config, layer_idx)
             self.mlp = Ernie4_5_MoeMoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 enable_eplb=enable_eplb,
+                num_experts=num_experts,
             )
         else:
             self.mlp = Ernie4_5_MoeMLP(
@@ -427,7 +505,17 @@ class Ernie4_5_MoeModel(nn.Module):
         eplb_config = parallel_config.eplb_config
         enable_eplb = parallel_config.enable_eplb
 
-        self.num_redundant_experts = eplb_config.num_redundant_experts
+        self.is_non_uniform_experts = _is_non_uniform_expert_config(config)
+        if self.is_non_uniform_experts and enable_eplb:
+            logger.warning(
+                "Non-uniform `num_experts_per_layer` detected; disabling EPLB "
+                "and redundant experts because EPLB policies assume a uniform "
+                "expert count across layers."
+            )
+            enable_eplb = False
+            self.num_redundant_experts = 0
+        else:
+            self.num_redundant_experts = eplb_config.num_redundant_experts
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -493,14 +581,33 @@ class Ernie4_5_MoeModel(nn.Module):
 
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+    def get_expert_mapping_for_layer(
+        self, layer_idx: int
+    ) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return SharedFusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.moe_num_experts,
+            num_experts=_get_num_experts_for_layer(self.config, layer_idx),
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Backward-compatible: return a mapping that covers the maximum expert
+        # id range across layers (sufficient for uniform models).
+        per_layer = getattr(self.config, "num_experts_per_layer", None)
+        max_experts = (
+            max(int(v) for v in per_layer)
+            if isinstance(per_layer, list) and per_layer
+            else int(self.config.moe_num_experts)
+        )
+        return SharedFusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=max_experts,
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -516,7 +623,7 @@ class Ernie4_5_MoeModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
+        expert_params_mapping_by_layer: dict[int, list[tuple[str, str, int, str]]] = {}
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and name.endswith("lm_head.weight"):
                 continue
@@ -524,8 +631,8 @@ class Ernie4_5_MoeModel(nn.Module):
             if "mtp" in name:
                 continue
 
-            if "e_score_correction_bias" in name:
-                name = name.replace("moe_statics", "gate")
+            if (remapped := _remap_moe_statics_bias_name(name)) is not None:
+                name = remapped
                 loaded_weight = loaded_weight.squeeze(0)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -550,7 +657,25 @@ class Ernie4_5_MoeModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                is_expert_weight = False
+                is_expert_weight = ".mlp.experts." in name
+                layer_idx = _parse_layer_idx_from_weight_name(name) if is_expert_weight else None
+                if is_expert_weight and layer_idx is None:
+                    # Can't determine target layer; treat as non-local expert.
+                    continue
+
+                if is_expert_weight:
+                    num_experts = _get_num_experts_for_layer(self.config, int(layer_idx))
+                    expert_idx = _parse_expert_idx_from_weight_name(name)
+                    if expert_idx is not None and expert_idx >= num_experts:
+                        # Checkpoint contains experts that are not present in
+                        # this layer's configured expert count.
+                        continue
+                    expert_params_mapping = expert_params_mapping_by_layer.setdefault(
+                        int(layer_idx), self.get_expert_mapping_for_layer(int(layer_idx))
+                    )
+                else:
+                    expert_params_mapping = []
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
 
@@ -697,18 +822,38 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExpe
             self.num_shared_experts = 0
             self.num_redundant_experts = 0
         else:
-            self.num_logical_experts = example_moe.n_logical_experts
-            self.num_physical_experts = example_moe.n_physical_experts
-            self.num_local_physical_experts = example_moe.n_local_physical_experts
-            self.num_routed_experts = example_moe.n_routed_experts
-            self.num_shared_experts = example_moe.n_shared_experts
-            self.num_redundant_experts = example_moe.n_redundant_experts
+            if getattr(self.model, "is_non_uniform_experts", False):
+                # For non-uniform expert configs, MoE layers may have different
+                # expert counts. vLLM's MoE interfaces require scalar metadata, so
+                # we expose the maximum across MoE layers.
+                self.num_logical_experts = max(
+                    m.global_num_experts for m in self.moe_layers
+                )
+                self.num_physical_experts = self.num_logical_experts
+                self.num_local_physical_experts = max(
+                    m.local_num_experts for m in self.moe_layers
+                )
+                self.num_routed_experts = self.num_logical_experts
+                self.num_shared_experts = example_moe.n_shared_experts
+                self.num_redundant_experts = 0
+            else:
+                self.num_logical_experts = example_moe.n_logical_experts
+                self.num_physical_experts = example_moe.n_physical_experts
+                self.num_local_physical_experts = example_moe.n_local_physical_experts
+                self.num_routed_experts = example_moe.n_routed_experts
+                self.num_shared_experts = example_moe.n_shared_experts
+                self.num_redundant_experts = example_moe.n_redundant_experts
 
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
+        if getattr(self.model, "is_non_uniform_experts", False):
+            raise ValueError(
+                "EPLB expert metadata updates are not supported for "
+                "non-uniform `num_experts_per_layer` models."
+            )
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
