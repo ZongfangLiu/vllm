@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -30,6 +31,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
@@ -78,6 +80,42 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_EXPERT_IDX_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def _parse_layer_idx_from_weight_name(name: str) -> int | None:
+    m = _LAYER_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_expert_idx_from_weight_name(name: str) -> int | None:
+    m = _EXPERT_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _get_num_experts_for_layer(config: PretrainedConfig, layer_idx: int) -> int:
+    get_num_experts = getattr(config, "get_num_experts", None)
+    if callable(get_num_experts):
+        return int(get_num_experts(layer_idx))
+
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if isinstance(per_layer, list) and 0 <= layer_idx < len(per_layer):
+        return int(per_layer[layer_idx])
+
+    return int(getattr(config, "num_experts", 0))
+
+
+def _is_non_uniform_expert_config(config: PretrainedConfig) -> bool:
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if not isinstance(per_layer, list) or not per_layer:
+        return False
+    try:
+        vals = [int(v) for v in per_layer]
+    except Exception:
+        return False
+    return len(set(vals)) > 1
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -123,6 +161,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        num_experts: int | None = None,
+        enable_eplb: bool | None = None,
+        num_redundant_experts: int | None = None,
     ):
         super().__init__()
 
@@ -135,23 +176,35 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
-        self.n_routed_experts = config.num_experts
+        layer_idx = extract_layer_index(prefix)
+        if num_experts is None:
+            if layer_idx is not None:
+                num_experts = _get_num_experts_for_layer(config, layer_idx)
+            else:
+                num_experts = getattr(config, "num_experts", 0)
+        self.n_routed_experts = int(num_experts)
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        if self.tp_size > config.num_experts:
+        if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"the number of experts {self.n_routed_experts}."
             )
 
         # Load balancing settings.
         vllm_config = get_current_vllm_config()
         eplb_config = vllm_config.parallel_config.eplb_config
-        self.enable_eplb = parallel_config.enable_eplb
+        self.enable_eplb = (
+            parallel_config.enable_eplb if enable_eplb is None else enable_eplb
+        )
 
         self.n_logical_experts = self.n_routed_experts
-        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_redundant_experts = (
+            eplb_config.num_redundant_experts
+            if num_redundant_experts is None
+            else int(num_redundant_experts)
+        )
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
@@ -162,7 +215,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            top_k=min(int(config.num_experts_per_tok), int(self.n_routed_experts)),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=True,
@@ -177,7 +230,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
-            config.num_experts,
+            self.n_routed_experts,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
@@ -314,7 +367,13 @@ class Qwen3MoeAttention(nn.Module):
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        enable_eplb: bool | None = None,
+        num_redundant_experts: int | None = None,
+    ) -> None:
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -346,11 +405,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
+        num_experts = (
+            _get_num_experts_for_layer(config, layer_idx)
+            if layer_idx is not None
+            else getattr(config, "num_experts", 0)
+        )
         if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+            num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+                num_experts=num_experts,
+                enable_eplb=enable_eplb,
+                num_redundant_experts=num_redundant_experts,
             )
         else:
             self.mlp = Qwen3MoeMLP(
@@ -397,7 +465,19 @@ class Qwen3MoeModel(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         eplb_config = parallel_config.eplb_config
-        self.num_redundant_experts = eplb_config.num_redundant_experts
+        enable_eplb = parallel_config.enable_eplb
+        self.is_non_uniform_experts = _is_non_uniform_expert_config(config)
+        if self.is_non_uniform_experts and enable_eplb:
+            logger.warning(
+                "Non-uniform `num_experts_per_layer` detected; disabling EPLB "
+                "and redundant experts because EPLB policies assume a uniform "
+                "expert count across layers."
+            )
+            enable_eplb = False
+        if self.is_non_uniform_experts:
+            self.num_redundant_experts = 0
+        else:
+            self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -411,7 +491,12 @@ class Qwen3MoeModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: Qwen3MoeDecoderLayer(
+                vllm_config=vllm_config,
+                prefix=prefix,
+                enable_eplb=enable_eplb,
+                num_redundant_experts=self.num_redundant_experts,
+            ),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -469,11 +554,28 @@ class Qwen3MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        per_layer = getattr(self.config, "num_experts_per_layer", None)
+        max_experts = (
+            max(int(v) for v in per_layer)
+            if isinstance(per_layer, list) and per_layer
+            else int(self.config.num_experts)
+        )
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=max_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def get_expert_mapping_for_layer(
+        self, layer_idx: int
+    ) -> list[tuple[str, str, int, str]]:
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=_get_num_experts_for_layer(self.config, layer_idx),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -503,7 +605,7 @@ class Qwen3MoeModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
+        expert_params_mapping_by_layer: dict[int, list[tuple[str, str, int, str]]] = {}
         for name, loaded_weight in weights:
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
@@ -555,7 +657,27 @@ class Qwen3MoeModel(nn.Module):
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                is_expert_weight = False
+                is_expert_weight = ".mlp.experts." in name
+                layer_idx = (
+                    _parse_layer_idx_from_weight_name(name)
+                    if is_expert_weight
+                    else None
+                )
+                if is_expert_weight and layer_idx is None:
+                    continue
+
+                if is_expert_weight:
+                    num_experts = _get_num_experts_for_layer(self.config, int(layer_idx))
+                    expert_idx = _parse_expert_idx_from_weight_name(name)
+                    if expert_idx is not None and expert_idx >= num_experts:
+                        continue
+                    expert_params_mapping = expert_params_mapping_by_layer.setdefault(
+                        int(layer_idx),
+                        self.get_expert_mapping_for_layer(int(layer_idx)),
+                    )
+                else:
+                    expert_params_mapping = []
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -691,17 +813,33 @@ class Qwen3MoeForCausalLM(
         self.num_moe_layers = len(self.moe_layers)
         self.num_expert_groups = 1
         self.num_shared_experts = 0
-        self.num_logical_experts = example_layer.n_logical_experts
-        self.num_physical_experts = example_layer.n_physical_experts
-        self.num_local_physical_experts = example_layer.n_local_physical_experts
-        self.num_routed_experts = example_layer.n_routed_experts
-        self.num_redundant_experts = example_layer.n_redundant_experts
+        if getattr(self.model, "is_non_uniform_experts", False):
+            self.num_logical_experts = max(
+                m.global_num_experts for m in self.moe_layers
+            )
+            self.num_physical_experts = self.num_logical_experts
+            self.num_local_physical_experts = max(
+                m.local_num_experts for m in self.moe_layers
+            )
+            self.num_routed_experts = self.num_logical_experts
+            self.num_redundant_experts = 0
+        else:
+            self.num_logical_experts = example_layer.n_logical_experts
+            self.num_physical_experts = example_layer.n_physical_experts
+            self.num_local_physical_experts = example_layer.n_local_physical_experts
+            self.num_routed_experts = example_layer.n_routed_experts
+            self.num_redundant_experts = example_layer.n_redundant_experts
 
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
+        if getattr(self.model, "is_non_uniform_experts", False):
+            raise ValueError(
+                "EPLB expert metadata updates are not supported for "
+                "non-uniform `num_experts_per_layer` models."
+            )
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
