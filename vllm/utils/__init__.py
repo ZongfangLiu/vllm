@@ -8,6 +8,13 @@ import torch
 MASK_64_BITS = (1 << 64) - 1
 
 
+def get_open_port() -> int:
+    """Compatibility shim for callers that import get_open_port from vllm.utils."""
+    from vllm.utils.network_utils import get_open_port as _get_open_port
+
+    return _get_open_port()
+
+
 def random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
 
