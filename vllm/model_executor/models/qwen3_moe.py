@@ -206,12 +206,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             else int(num_redundant_experts)
         )
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
 
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -227,6 +221,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             routing_method_type=RoutingMethodType.Renormalize,
         )
+
+        # Align metadata with FusedMoE's EP partitioning logic (remainder-aware).
+        self.n_physical_experts = self.experts.global_num_experts
+        self.n_local_physical_experts = self.experts.local_num_experts
+        base_experts = self.n_physical_experts // self.ep_size
+        remainder = self.n_physical_experts % self.ep_size
+        start_idx = self.ep_rank * base_experts + min(self.ep_rank, remainder)
+        self.physical_expert_start = start_idx
+        self.physical_expert_end = start_idx + self.n_local_physical_experts
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
