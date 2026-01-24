@@ -470,13 +470,15 @@ class Qwen3MoeModel(nn.Module):
         eplb_config = parallel_config.eplb_config
         enable_eplb = parallel_config.enable_eplb
         self.is_non_uniform_experts = _is_non_uniform_expert_config(config)
-        if self.is_non_uniform_experts and enable_eplb:
+        if self.is_non_uniform_experts and parallel_config.enable_eplb:
             logger.warning(
-                "Non-uniform `num_experts_per_layer` detected; disabling EPLB "
-                "and redundant experts because EPLB policies assume a uniform "
-                "expert count across layers."
+                "Non-uniform `num_experts_per_layer` detected; forcing EPLB off "
+                "and clearing redundant experts because EPLB policies assume a "
+                "uniform expert count across layers."
             )
-            enable_eplb = False
+            parallel_config.enable_eplb = False
+            eplb_config.num_redundant_experts = 0
+        enable_eplb = parallel_config.enable_eplb
         if self.is_non_uniform_experts:
             self.num_redundant_experts = 0
         else:
