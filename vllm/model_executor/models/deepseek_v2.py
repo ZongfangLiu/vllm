@@ -24,13 +24,14 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
 from torch import nn
-from transformers import DeepseekV2Config, DeepseekV3Config
+from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.backends.abstract import AttentionBackend
@@ -100,6 +101,42 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
 
 logger = init_logger(__name__)
+
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_EXPERT_IDX_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def _parse_layer_idx_from_weight_name(name: str) -> int | None:
+    m = _LAYER_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_expert_idx_from_weight_name(name: str) -> int | None:
+    m = _EXPERT_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _get_num_experts_for_layer(config: PretrainedConfig, layer_idx: int) -> int:
+    get_num_experts = getattr(config, "get_num_experts", None)
+    if callable(get_num_experts):
+        return int(get_num_experts(layer_idx))
+
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if isinstance(per_layer, list) and 0 <= layer_idx < len(per_layer):
+        return int(per_layer[layer_idx])
+
+    return int(getattr(config, "n_routed_experts", 0) or 0)
+
+
+def _is_non_uniform_expert_config(config: PretrainedConfig) -> bool:
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if not isinstance(per_layer, list) or not per_layer:
+        return False
+    try:
+        vals = [int(v) for v in per_layer]
+    except Exception:
+        return False
+    return len(set(vals)) > 1
 
 
 class DeepseekAttention(nn.Module):
@@ -237,6 +274,9 @@ class DeepseekV2MoE(nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        enable_eplb: bool | None = None,
+        num_redundant_experts: int | None = None,
+        num_experts: int | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -247,10 +287,21 @@ class DeepseekV2MoE(nn.Module):
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
-        self.n_routed_experts: int = config.n_routed_experts
+        self.n_routed_experts = (
+            int(num_experts)
+            if num_experts is not None
+            else int(getattr(config, "n_routed_experts", 0) or 0)
+        )
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+
+        if self.n_routed_experts <= 0:
+            raise ValueError(
+                "Invalid routed expert count for DeepSeek layer: "
+                f"{self.n_routed_experts}. Check `n_routed_experts` and/or "
+                "`num_experts_per_layer` in the HF config."
+            )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -260,31 +311,31 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
-            config.n_routed_experts,
+            self.n_routed_experts,
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32)
+                torch.empty(self.n_routed_experts, dtype=torch.float32)
             )
         else:
             self.gate.e_score_correction_bias = None
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
-        self.enable_eplb = parallel_config.enable_eplb
+        self.enable_eplb = (
+            parallel_config.enable_eplb if enable_eplb is None else enable_eplb
+        )
 
-        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_redundant_experts = (
+            eplb_config.num_redundant_experts
+            if num_redundant_experts is None
+            else int(num_redundant_experts)
+        )
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
 
         self.is_rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
         self.is_fusion_moe_shared_experts_enabled = (
@@ -308,8 +359,8 @@ class DeepseekV2MoE(nn.Module):
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=self.n_routed_experts,
+            top_k=min(int(config.num_experts_per_tok), self.n_routed_experts),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
@@ -333,6 +384,15 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
         )
+
+        # Align metadata with SharedFusedMoE's EP partitioning logic.
+        self.n_physical_experts = self.experts.global_num_experts
+        self.n_local_physical_experts = self.experts.local_num_experts
+        base_experts = self.n_physical_experts // self.ep_size
+        remainder = self.n_physical_experts % self.ep_size
+        start_idx = self.ep_rank * base_experts + min(self.ep_rank, remainder)
+        self.physical_expert_start = start_idx
+        self.physical_expert_end = start_idx + self.n_local_physical_experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -1113,6 +1173,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        enable_eplb: bool | None = None,
+        num_redundant_experts: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -1165,8 +1227,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
+        layer_num_experts = _get_num_experts_for_layer(config, layer_idx)
         if (
-            config.n_routed_experts is not None
+            layer_num_experts > 0
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % moe_layer_freq == 0
         ):
@@ -1175,6 +1238,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                enable_eplb=enable_eplb,
+                num_redundant_experts=num_redundant_experts,
+                num_experts=layer_num_experts,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -1249,8 +1315,23 @@ class DeepseekV2Model(nn.Module):
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
+        eplb_config = parallel_config.eplb_config
+        enable_eplb = parallel_config.enable_eplb
         self.config = config
         self.device = current_platform.device_type
+        self.is_non_uniform_experts = _is_non_uniform_expert_config(config)
+
+        if self.is_non_uniform_experts and enable_eplb:
+            logger.warning(
+                "Non-uniform `num_experts_per_layer` detected; disabling EPLB "
+                "and redundant experts because EPLB policies assume a uniform "
+                "expert count across layers."
+            )
+            enable_eplb = False
+            self.num_redundant_experts = 0
+        else:
+            self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
@@ -1277,7 +1358,11 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+                vllm_config,
+                prefix,
+                topk_indices_buffer=topk_indices_buffer,
+                enable_eplb=enable_eplb,
+                num_redundant_experts=self.num_redundant_experts,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1338,6 +1423,41 @@ class DeepseekV2Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def get_expert_mapping(
+        self, include_fused_shared_experts: bool = False
+    ) -> list[tuple[str, str, int, str]]:
+        per_layer = getattr(self.config, "num_experts_per_layer", None)
+        max_experts = (
+            max(int(v) for v in per_layer)
+            if isinstance(per_layer, list) and per_layer
+            else int(getattr(self.config, "n_routed_experts", 0) or 0)
+        )
+        if include_fused_shared_experts:
+            max_experts += int(getattr(self.config, "n_shared_experts", 0) or 0)
+        return SharedFusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=max_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def get_expert_mapping_for_layer(
+        self,
+        layer_idx: int,
+        include_fused_shared_experts: bool = False,
+    ) -> list[tuple[str, str, int, str]]:
+        num_experts = _get_num_experts_for_layer(self.config, layer_idx)
+        if include_fused_shared_experts:
+            num_experts += int(getattr(self.config, "n_shared_experts", 0) or 0)
+        return SharedFusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
 
 class DeepseekV2MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list[DeepseekV2MoE]
@@ -1357,18 +1477,35 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             self.num_redundant_experts = 0
             logger.warning("DeepSeekV2: No DeepseekV2MoE layer found in model.layers.")
         else:
-            self.num_logical_experts = example_moe.n_logical_experts
-            self.num_physical_experts = example_moe.n_physical_experts
-            self.num_local_physical_experts = example_moe.n_local_physical_experts
-            self.num_routed_experts = example_moe.n_routed_experts
-            self.num_shared_experts = example_moe.n_shared_experts
-            self.num_redundant_experts = example_moe.n_redundant_experts
+            if getattr(self.model, "is_non_uniform_experts", False):
+                self.num_logical_experts = max(
+                    m.global_num_experts for m in self.moe_layers
+                )
+                self.num_physical_experts = self.num_logical_experts
+                self.num_local_physical_experts = max(
+                    m.local_num_experts for m in self.moe_layers
+                )
+                self.num_routed_experts = self.num_logical_experts
+                self.num_shared_experts = example_moe.n_shared_experts
+                self.num_redundant_experts = 0
+            else:
+                self.num_logical_experts = example_moe.n_logical_experts
+                self.num_physical_experts = example_moe.n_physical_experts
+                self.num_local_physical_experts = example_moe.n_local_physical_experts
+                self.num_routed_experts = example_moe.n_routed_experts
+                self.num_shared_experts = example_moe.n_shared_experts
+                self.num_redundant_experts = example_moe.n_redundant_experts
 
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
+        if getattr(self.model, "is_non_uniform_experts", False):
+            raise ValueError(
+                "EPLB expert metadata updates are not supported for "
+                "non-uniform `num_experts_per_layer` models."
+            )
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
@@ -1433,10 +1570,6 @@ class DeepseekV2ForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        # Set MoE hyperparameters
-        self.num_moe_layers = (
-            self.config.num_hidden_layers - self.config.first_k_dense_replace
-        )
         self.set_moe_parameters()
 
     def set_moe_parameters(self):
@@ -1458,6 +1591,7 @@ class DeepseekV2ForCausalLM(
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
+        self.num_moe_layers = len(self.moe_mlp_layers)
         self.extract_moe_parameters(example_moe)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1483,19 +1617,30 @@ class DeepseekV2ForCausalLM(
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return SharedFusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
+        include_fused_shared_experts = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            and bool(getattr(self.config, "n_shared_experts", 0))
+        )
+        return self.model.get_expert_mapping(
+            include_fused_shared_experts=include_fused_shared_experts
+        )
+
+    def get_expert_mapping_for_layer(
+        self,
+        layer_idx: int,
+        include_fused_shared_experts: bool = False,
+    ) -> list[tuple[str, str, int, str]]:
+        return self.model.get_expert_mapping_for_layer(
+            layer_idx,
+            include_fused_shared_experts=include_fused_shared_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
+        include_fused_shared_experts = rocm_aiter_moe_shared_expert_enabled and bool(
+            getattr(self.config, "n_shared_experts", 0)
         )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1516,23 +1661,9 @@ class DeepseekV2ForCausalLM(
         else:
             stacked_params_mapping.extend(mla_params_mapping)
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if rocm_aiter_moe_shared_expert_enabled
-                else 0
-            ),
-            num_redundant_experts=self.num_redundant_experts,
-        )
-
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        expert_params_mapping_by_layer: dict[int, list[tuple[str, str, int, str]]] = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1583,6 +1714,33 @@ class DeepseekV2ForCausalLM(
                 break
             else:
                 is_expert_weight = False
+                layer_idx = _parse_layer_idx_from_weight_name(
+                    name
+                ) if (".mlp.experts." in name or is_fusion_moe_shared_experts_layer) else None
+                layer_num_experts = (
+                    _get_num_experts_for_layer(self.config, int(layer_idx))
+                    if layer_idx is not None
+                    else None
+                )
+
+                if ".mlp.experts." in name and layer_idx is None:
+                    continue
+                if ".mlp.experts." in name and layer_num_experts is not None:
+                    expert_idx = _parse_expert_idx_from_weight_name(name)
+                    if expert_idx is not None and expert_idx >= layer_num_experts:
+                        continue
+
+                expert_params_mapping = (
+                    expert_params_mapping_by_layer.setdefault(
+                        int(layer_idx),
+                        self.get_expert_mapping_for_layer(
+                            int(layer_idx),
+                            include_fused_shared_experts=include_fused_shared_experts,
+                        ),
+                    )
+                    if layer_idx is not None
+                    else []
+                )
 
                 # Special handling: when AITER fusion_shared_experts is enabled,
                 # checkpoints may provide a single widened shared_experts tensor
@@ -1624,9 +1782,10 @@ class DeepseekV2ForCausalLM(
                             weight_to_load = loaded_weight[:, chunk_slice]
                         # Synthesize an expert-style name so expert mapping
                         # can route it
+                        assert layer_num_experts is not None
                         chunk_name = name.replace(
                             "mlp.shared_experts",
-                            f"mlp.experts.{self.config.n_routed_experts + j}",
+                            f"mlp.experts.{layer_num_experts + j}",
                         )
 
                     # Use expert_params_mapping to locate the destination
