@@ -24,22 +24,24 @@
 # limitations under the License.
 """Inference-only Mixtral model."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
 from torch import nn
-from transformers import MixtralConfig
+from transformers import MixtralConfig, PretrainedConfig
 
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -64,11 +66,50 @@ from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
+
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_EXPERT_IDX_RE = re.compile(r"\.experts\.(\d+)\.")
+
+
+def _parse_layer_idx_from_weight_name(name: str) -> int | None:
+    m = _LAYER_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_expert_idx_from_weight_name(name: str) -> int | None:
+    m = _EXPERT_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _get_num_experts_for_layer(config: PretrainedConfig, layer_idx: int) -> int:
+    get_num_experts = getattr(config, "get_num_experts", None)
+    if callable(get_num_experts):
+        return int(get_num_experts(layer_idx))
+
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if isinstance(per_layer, list) and 0 <= layer_idx < len(per_layer):
+        return int(per_layer[layer_idx])
+
+    return int(getattr(config, "num_local_experts", 0))
+
+
+def _is_non_uniform_expert_config(config: PretrainedConfig) -> bool:
+    per_layer = getattr(config, "num_experts_per_layer", None)
+    if not isinstance(per_layer, list) or not per_layer:
+        return False
+    try:
+        vals = [int(v) for v in per_layer]
+    except Exception:
+        return False
+    return len(set(vals)) > 1
 
 
 class MixtralMoE(nn.Module):
@@ -92,6 +133,7 @@ class MixtralMoE(nn.Module):
         dp_size: int | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        num_redundant_experts: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -100,26 +142,24 @@ class MixtralMoE(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
 
-        # Expert Parallelism Load balancing settings.
-        vllm_config = get_current_vllm_config()
-        parallel_config = vllm_config.parallel_config
         self.enable_eplb = enable_eplb
 
-        self.n_routed_experts = num_experts
-        self.n_logical_experts = num_experts
-        self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+        self.n_routed_experts = int(num_experts)
+        if self.n_routed_experts <= 0:
+            raise ValueError(
+                f"Invalid routed expert count for Mixtral layer: "
+                f"{self.n_routed_experts}. Check `num_local_experts` and/or "
+                "`num_experts_per_layer` in the HF config."
+            )
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = int(num_redundant_experts)
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
 
         # Gate always runs at half / full precision for now.
 
         self.gate = ReplicatedLinear(
             hidden_size,
-            num_experts,
+            self.n_routed_experts,
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
@@ -127,8 +167,8 @@ class MixtralMoE(nn.Module):
         )
 
         self.experts = FusedMoE(
-            num_experts=num_experts,
-            top_k=top_k,
+            num_experts=self.n_routed_experts,
+            top_k=min(int(top_k), self.n_routed_experts),
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
@@ -141,6 +181,13 @@ class MixtralMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
         )
+        self.n_physical_experts = self.experts.global_num_experts
+        self.n_local_physical_experts = self.experts.local_num_experts
+        base_experts = self.n_physical_experts // self.ep_size
+        remainder = self.n_physical_experts % self.ep_size
+        start_idx = self.ep_rank * base_experts + min(self.ep_rank, remainder)
+        self.physical_expert_start = start_idx
+        self.physical_expert_end = start_idx + self.n_local_physical_experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -241,9 +288,11 @@ class MixtralDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        num_redundant_experts: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        layer_idx = extract_layer_index(prefix)
         self.self_attn = MixtralAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -255,13 +304,14 @@ class MixtralDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         self.block_sparse_moe = MixtralMoE(
-            num_experts=config.num_local_experts,
+            num_experts=_get_num_experts_for_layer(config, layer_idx),
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
             enable_eplb=enable_eplb,
+            num_redundant_experts=num_redundant_experts,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -304,6 +354,7 @@ class MixtralModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.is_non_uniform_experts = _is_non_uniform_expert_config(config)
 
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
@@ -314,7 +365,16 @@ class MixtralModel(nn.Module):
         )
 
         self.enable_eplb = parallel_config.enable_eplb
-        self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+        if self.is_non_uniform_experts and self.enable_eplb:
+            logger.warning(
+                "Non-uniform `num_experts_per_layer` detected; disabling EPLB "
+                "and redundant experts because EPLB policies assume a uniform "
+                "expert count across layers."
+            )
+            self.enable_eplb = False
+            self.num_redundant_experts = 0
+        else:
+            self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -324,6 +384,7 @@ class MixtralModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.num_redundant_experts,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -365,11 +426,28 @@ class MixtralModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        per_layer = getattr(self.config, "num_experts_per_layer", None)
+        max_experts = (
+            max(int(v) for v in per_layer)
+            if isinstance(per_layer, list) and per_layer
+            else int(self.config.num_local_experts)
+        )
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+            num_experts=max_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def get_expert_mapping_for_layer(
+        self, layer_idx: int
+    ) -> list[tuple[str, str, int, str]]:
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=_get_num_experts_for_layer(self.config, layer_idx),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -383,7 +461,7 @@ class MixtralModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
+        expert_params_mapping_by_layer: dict[int, list[tuple[str, str, int, str]]] = {}
         for name, loaded_weight in weights:
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
@@ -420,7 +498,25 @@ class MixtralModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                is_expert_weight = False
+                is_expert_weight = ".experts." in name
+                layer_idx = (
+                    _parse_layer_idx_from_weight_name(name) if is_expert_weight else None
+                )
+                if is_expert_weight and layer_idx is None:
+                    continue
+
+                if is_expert_weight:
+                    num_experts = _get_num_experts_for_layer(self.config, int(layer_idx))
+                    expert_idx = _parse_expert_idx_from_weight_name(name)
+                    if expert_idx is not None and expert_idx >= num_experts:
+                        continue
+                    expert_params_mapping = expert_params_mapping_by_layer.setdefault(
+                        int(layer_idx),
+                        self.get_expert_mapping_for_layer(int(layer_idx)),
+                    )
+                else:
+                    expert_params_mapping = []
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
 
@@ -541,19 +637,35 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
         if example_moe is None:
             raise RuntimeError("No MixtralMoE layer found  in model.layers.")
 
-        self.num_logical_experts = example_moe.n_logical_experts
-        self.num_physical_experts = example_moe.n_physical_experts
-        self.num_local_physical_experts = example_moe.n_local_physical_experts
-        self.num_routed_experts = example_moe.n_routed_experts
-        self.num_redundant_experts = example_moe.n_redundant_experts
         self.num_expert_groups = 1
         self.num_shared_experts = 0
+        if getattr(self.model, "is_non_uniform_experts", False):
+            self.num_logical_experts = max(
+                m.global_num_experts for m in self.moe_layers
+            )
+            self.num_physical_experts = self.num_logical_experts
+            self.num_local_physical_experts = max(
+                m.local_num_experts for m in self.moe_layers
+            )
+            self.num_routed_experts = self.num_logical_experts
+            self.num_redundant_experts = 0
+        else:
+            self.num_logical_experts = example_moe.n_logical_experts
+            self.num_physical_experts = example_moe.n_physical_experts
+            self.num_local_physical_experts = example_moe.n_local_physical_experts
+            self.num_routed_experts = example_moe.n_routed_experts
+            self.num_redundant_experts = example_moe.n_redundant_experts
 
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
+        if getattr(self.model, "is_non_uniform_experts", False):
+            raise ValueError(
+                "EPLB expert metadata updates are not supported for "
+                "non-uniform `num_experts_per_layer` models."
+            )
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
